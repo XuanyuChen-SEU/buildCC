@@ -56,90 +56,102 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+TASKS_DIR = WORKDIR / ".tasks"
 
-SYSTEM = f"You are a coding agent at {WORKDIR}.  Use tools to solve tasks"
-
-THRESHOLD = 50000
-KEEP_RECENT = 3
-TRANSCRIPT_DIR = WORKDIR / ".transcripts"
-PRESERVE_RESULT_TOOLS = {"read_file"}
+SYSTEM = f"You are a coding agent at {WORKDIR}.  Use task tools to plan and track work."
 
 
-def estimate_tokens(messages: list) -> int:
-    """粗略 token 估算：约每 4 个字符算 1 个 token。"""
-    return len(str(messages)) // 4
+class TaskManager:
+    def __init__(self, tasks_dir: Path):
+        self.dir = tasks_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._next_id = self._max_id() + 1
+
+    def _max_id(self) -> int:
+        # 遍历形如 task_*.json 的任务文件，提取其中的数字 ID：
+        # 1) f.stem 去掉 .json 后缀，例如 task_23.json -> task_23
+        # 2) split("_")[1] 取下划线后的编号字符串 "23"
+        # 3) int(...) 转为整数 23
+        # 最终得到所有任务 ID 组成的列表 ids
+        ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
+        return max(ids) if ids else 0
+
+    def _load(self, task_id: int) -> dict:
+        path = self.dir / f"task_{task_id}.json"
+        if not path.exists():
+            raise ValueError(f"Task {task_id} not found")
+        return json.loads(path.read_text())
+
+    def _save(self, task: dict):
+        path = self.dir / f"task_{task['id']}.json"
+        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
+
+    def create(self, subject: str, description: str = "") -> str:
+        task = {
+            "id": self._next_id,
+            "subject": subject,
+            "description": description,
+            "status": "pending",
+            "blockedBy": [],
+            "owner": "",
+        }
+        self._save(task)
+        self._next_id += 1
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def get(self, task_id: int) -> str:
+        return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
+
+    def update(
+        self,
+        task_id: int,
+        status: str = None,
+        add_blocked_by: list = None,
+        remove_blocked_by: list = None,
+    ) -> str:
+        task = self._load(task_id)
+        if status:
+            task["status"] = status
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Invalid status: {status}")
+            if status == "completed":
+                self._clear_dependency(task_id)
+        if add_blocked_by:
+            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+        if remove_blocked_by:
+            task["blockedBy"] = [
+                x for x in task["blockedBy"] if x not in remove_blocked_by
+            ]
+        self._save(task)
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def _clear_dependency(self, completed_id: int):
+        for f in self.dir.glob("task_*.json"):
+            task = json.loads(f.read_text())
+            if completed_id in task.get("blockedBy", []):
+                task["blockedBy"].remove(completed_id)
+                self._save(task)
+
+    def list_all(self) -> str:
+        tasks = []
+        files = sorted(
+            self.dir.glob("task_*.json"), key=lambda f: int(f.stem.split("_")[1])
+        )
+        for f in files:
+            tasks.append(json.loads(f.read_text()))
+        if not tasks:
+            return "No tasks."
+        lines = []
+        for t in tasks:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(
+                t["status"], "[?]"
+            )
+            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
+        return "\n".join(lines)
 
 
-def micro_compact(messages: list) -> list:
-    """将除 read_file 之外、且早于最近 3 条的 tool_result 内容，
-    替换为 "[Previous: used {tool_name}]"
-    """
-    tool_results = []
-    for msg_idx, msg in enumerate(messages):
-        if msg["role"] == "user" and isinstance(msg["content"], list):
-            for part_idx, part in enumerate(msg["content"]):
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    tool_results.append((msg_idx, part_idx, part))
-    if len(tool_results) <= KEEP_RECENT:
-        return messages
-    tool_name_map = {}
-    for msg in messages:
-        if msg["role"] == "assistant":
-            content = msg.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if hasattr(block, "type") and block.type == "tool_use":
-                        tool_name_map[block.id] = block.name
-    to_clean = tool_results[:-KEEP_RECENT]
-    for _, _, result in to_clean:
-        if (
-            not isinstance(result.get("content"), str)
-            or len(result.get("content")) < 100
-        ):
-            continue
-        tool_use_id = result.get("tool_use_id", "")
-        tool_name = tool_name_map.get(tool_use_id, "")
-        if tool_name in PRESERVE_RESULT_TOOLS:
-            continue
-        result["content"] = f"[Previous: used {tool_name}]"
-    return messages
-
-
-def auto_compact(messages: list) -> list:
-    """将完整对话保存到 .transcripts/
-    让 LLM 对会话做总结。
-    将全部 messages 替换为 [summary]。
-    """
-    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(transcript_path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    print(f"Saved transcript to {transcript_path}")
-    conversation_text = json.dumps(messages, default=str)
-    response = client.messages.create(
-        model=MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": "Summarize this conversation for continuity. Include: "
-                "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-                "Be concise but preserve critical details.\n\n" + conversation_text,
-            }
-        ],
-        max_tokens=2000,
-    )
-    summary = next(
-        (block.text for block in response.content if hasattr(block, "text")), ""
-    )  # 只拿第一个有 text 的 block
-    if not summary:
-        summary = "No summary generated."
-    return [
-        {
-            "role": "user",
-            "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}",
-        },
-    ]
+TASKS = TaskManager(TASKS_DIR)
 
 
 # -- Tool implementations --
@@ -206,7 +218,15 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "compact": lambda **kw: "Manual compression requested",
+    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+    "task_update": lambda **kw: TASKS.update(
+        kw["task_id"],
+        kw.get("status"),
+        kw.get("addBlockedBy"),
+        kw.get("removeBlockedBy"),
+    ),
+    "task_list": lambda **kw: TASKS.list_all(),
+    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
 }
 
 TOOLS = [
@@ -263,17 +283,58 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "task_create",
+        "description": "Create a new task.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["subject"],
+        },
+    },
+    {
+        "name": "task_update",
+        "description": "Update a task's status or dependencies.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer"},
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "in_progress", "completed"],
+                },
+                "addBlockedBy": {"type": "array", "items": {"type": "integer"}},
+                "removeBlockedBy": {"type": "array", "items": {"type": "integer"}},
+            },
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "task_list",
+        "description": "List all tasks with status summary.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "task_get",
+        "description": "Get full details of a task by ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "integer"}},
+            "required": ["task_id"],
+        },
+    },
 ]
 
 
 # -- Agent loop with nag reminder injection --
 def agent_loop(messages: list):
-    rounds_since_todo = 0
     while True:
-        micro_compact(messages)
-        if estimate_tokens(messages) > THRESHOLD:
-            print("[auto compact triggered]")
-            messages[:] = auto_compact(messages)
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -287,19 +348,15 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                if block.name == "compact":
-                    manual_compact = True
-                    output = "Compressing..."
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    try:
-                        output = (
-                            handler(**block.input)
-                            if handler
-                            else f"Unknown tool: {block.name}"
-                        )
-                    except Exception as e:
-                        output = f"Error: {e}"
+                handler = TOOL_HANDLERS.get(block.name)
+                try:
+                    output = (
+                        handler(**block.input)
+                        if handler
+                        else f"Unknown tool: {block.name}"
+                    )
+                except Exception as e:
+                    output = f"Error: {e}"
                 print(f"> {block.name}:")
                 print(str(output)[:200])
                 results.append(
@@ -310,10 +367,6 @@ def agent_loop(messages: list):
                     }
                 )
         messages.append({"role": "user", "content": results})
-        if manual_compact:
-            print("[manual compact requested]")
-            messages[:] = auto_compact(messages)
-            return
 
 
 if __name__ == "__main__":
