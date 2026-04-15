@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-# 框架：持久化任务——能跨越单次对话生命周期的目标。
+# Harness: 后台执行 —— 当 harness 在等待时，模型可以继续思考。
 """
-s07_task_system.py - 任务（Tasks）
+s08_background_tasks.py - 后台任务
 
-任务以 JSON 文件形式持久化在 `.tasks/` 中，因此可以在上下文压缩后继续保留。
-每个任务都有依赖关系图（`blockedBy`）。
+在后台线程中运行命令。每次调用 LLM 之前，
+都会先清空通知队列并把结果投递回来。
 
-    .tasks/
-      task_1.json  {"id":1, "subject":"...", "status":"completed", ...}
-      task_2.json  {"id":2, "blockedBy":[1], "status":"pending", ...}
-      task_3.json  {"id":3, "blockedBy":[2], ...}
+    主线程                     后台线程
+    +-----------------+        +-----------------+
+    | agent 循环      |        | 任务执行中      |
+    | ...             |        | ...             |
+    | [LLM 调用] <---+------- | 入队(result)    |
+    |  ^清空队列      |        +-----------------+
+    +-----------------+
 
-    依赖关系解析：
-    +----------+     +----------+     +----------+
-    | task 1   | --> | task 2   | --> | task 3   |
-    | 已完成    |     | 被阻塞    |     | 被阻塞    |
-    +----------+     +----------+     +----------+
-         |                ^
-         +--- 完成 task 1 后，会把它从 task 2 的 blockedBy 中移除
+    时间线：
+    Agent ----[启动 A]----[启动 B]----[做其他工作]----
+                 |              |
+                 v              v
+              [A 运行]       [B 运行]      （并行）
+                 |              |
+                 +---------- 通知队列 --> [结果被注入]
 
-关键洞察：“状态之所以能在压缩后保留，是因为它存放在对话之外。”
+关键洞察："发射后不管（fire and forget）——命令运行时，agent 不会被阻塞。"
 """
 
 
@@ -27,7 +30,9 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
+import uuid
 import yaml
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,102 +61,78 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
-TASKS_DIR = WORKDIR / ".tasks"
 
 SYSTEM = f"You are a coding agent at {WORKDIR}.  Use task tools to plan and track work."
 
 
-class TaskManager:
-    def __init__(self, tasks_dir: Path):
-        self.dir = tasks_dir
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self._next_id = self._max_id() + 1
+class BackgroundManager:
+    def __init__(self):
+        self.tasks = {}
+        self._notification_queue = []  # 通知队列，已经完成的任务的结果
+        self._lock = threading.Lock()
 
-    def _max_id(self) -> int:
-        # 遍历形如 task_*.json 的任务文件，提取其中的数字 ID：
-        # 1) f.stem 去掉 .json 后缀，例如 task_23.json -> task_23
-        # 2) split("_")[1] 取下划线后的编号字符串 "23"
-        # 3) int(...) 转为整数 23
-        # 最终得到所有任务 ID 组成的列表 ids
-        ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
-        return max(ids) if ids else 0
-
-    def _load(self, task_id: int) -> dict:
-        path = self.dir / f"task_{task_id}.json"
-        if not path.exists():
-            raise ValueError(f"Task {task_id} not found")
-        return json.loads(path.read_text())
-
-    def _save(self, task: dict):
-        path = self.dir / f"task_{task['id']}.json"
-        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
-
-    def create(self, subject: str, description: str = "") -> str:
-        task = {
-            "id": self._next_id,
-            "subject": subject,
-            "description": description,
-            "status": "pending",
-            "blockedBy": [],
-            "owner": "",
-        }
-        self._save(task)
-        self._next_id += 1
-        return json.dumps(task, indent=2, ensure_ascii=False)
-
-    def get(self, task_id: int) -> str:
-        return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
-
-    def update(
-        self,
-        task_id: int,
-        status: str = None,
-        add_blocked_by: list = None,
-        remove_blocked_by: list = None,
-    ) -> str:
-        task = self._load(task_id)
-        if status:
-            task["status"] = status
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"Invalid status: {status}")
-            if status == "completed":
-                self._clear_dependency(task_id)
-        if add_blocked_by:
-            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
-        if remove_blocked_by:
-            task["blockedBy"] = [
-                x for x in task["blockedBy"] if x not in remove_blocked_by
-            ]
-        self._save(task)
-        return json.dumps(task, indent=2, ensure_ascii=False)
-
-    def _clear_dependency(self, completed_id: int):
-        for f in self.dir.glob("task_*.json"):
-            task = json.loads(f.read_text())
-            if completed_id in task.get("blockedBy", []):
-                task["blockedBy"].remove(completed_id)
-                self._save(task)
-
-    def list_all(self) -> str:
-        tasks = []
-        files = sorted(
-            self.dir.glob("task_*.json"), key=lambda f: int(f.stem.split("_")[1])
+    def run(self, command: str) -> str:
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {"status": "running", "command": command}
+        thread = threading.Thread(
+            target=self._execute,
+            args=(task_id, command),
+            daemon=True,  # 守护线程，主线程退出时，子线程也会退出
         )
-        for f in files:
-            tasks.append(json.loads(f.read_text()))
-        if not tasks:
-            return "No tasks."
-        lines = []
-        for t in tasks:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(
-                t["status"], "[?]"
+        thread.start()
+        return f"Background task {task_id} started"
+
+    def _execute(self, task_id: str, command: str):
+        try:
+            r = subprocess.run(
+                command,
+                shell=True,
+                cwd=WORKDIR,
+                capture_output=True,
+                text=True,
+                timeout=300,
             )
-            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
-            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
-        return "\n".join(lines)
+            output = (r.stdout + r.stderr).strip()[:50000]
+            status = "completed"
+        except subprocess.TimeoutExpired:
+            output = "Error: Timeout (300s)"
+            status = "timeout"
+        except Exception as e:
+            output = f"Error: {e}"
+            status = "error"
+        self.tasks[task_id]["status"] = status
+        self.tasks[task_id]["result"] = output or "(no output)"
+        with self._lock:
+            self._notification_queue.append(
+                {
+                    "task_id": task_id,
+                    "status": status,
+                    "command": command,
+                    "result": (output or "(no output)")[:500],
+                }
+            )
+
+    def check(self, task_id: str = None) -> str:
+        if task_id:
+            t = self.tasks.get(task_id)
+            if not t:
+                return f"Error: Unknown task {task_id}"
+            return (
+                f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
+            )
+        lines = []
+        for tid, t in self.tasks.items():
+            lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
+        return "\n".join(lines) if lines else "No background tasks."
+
+    def drain_notifications(self) -> list:
+        with self._lock:
+            notifs = list(self._notification_queue)
+            self._notification_queue.clear()
+        return notifs
 
 
-TASKS = TaskManager(TASKS_DIR)
+BG = BackgroundManager()
 
 
 # -- Tool implementations --
@@ -218,15 +199,8 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
-    "task_update": lambda **kw: TASKS.update(
-        kw["task_id"],
-        kw.get("status"),
-        kw.get("addBlockedBy"),
-        kw.get("removeBlockedBy"),
-    ),
-    "task_list": lambda **kw: TASKS.list_all(),
-    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
+    "background_run": lambda **kw: BG.run(kw["command"]),
+    "check_background": lambda **kw: BG.check(kw.get("task_id")),
 }
 
 TOOLS = [
@@ -271,49 +245,20 @@ TOOLS = [
         },
     },
     {
-        "name": "task_create",
-        "description": "Create a new task.",
+        "name": "background_run",
+        "description": "Run command in background thread. Returns task_id immediately.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "subject": {"type": "string"},
-                "description": {"type": "string"},
-            },
-            "required": ["subject"],
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
         },
     },
     {
-        "name": "task_update",
-        "description": "Update a task's status or dependencies.",
+        "name": "check_background",
+        "description": "Check background task status. Omit task_id to list all.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "task_id": {"type": "integer"},
-                "status": {
-                    "type": "string",
-                    "enum": ["pending", "in_progress", "completed"],
-                },
-                "addBlockedBy": {"type": "array", "items": {"type": "integer"}},
-                "removeBlockedBy": {"type": "array", "items": {"type": "integer"}},
-            },
-            "required": ["task_id"],
-        },
-    },
-    {
-        "name": "task_list",
-        "description": "List all tasks with status summary.",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-        },
-    },
-    {
-        "name": "task_get",
-        "description": "Get full details of a task by ID.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"task_id": {"type": "integer"}},
-            "required": ["task_id"],
+            "properties": {"task_id": {"type": "string"}},
         },
     },
 ]
@@ -322,6 +267,17 @@ TOOLS = [
 # -- Agent loop with nag reminder injection --
 def agent_loop(messages: list):
     while True:
+        notifs = BG.drain_notifications()
+        if notifs and messages:
+            notif_text = "\n".join(
+                f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"<background-results>\n{notif_text}\n</background-results>",
+                }
+            )
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
