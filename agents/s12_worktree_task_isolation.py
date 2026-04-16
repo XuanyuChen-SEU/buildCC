@@ -454,6 +454,7 @@ class WorktreeManager:
                 task_id = wt["task_id"]
                 before = json.loads(self.tasks.get(task_id))
                 self.tasks.update(task_id, status="completed")
+                self.tasks.unbind_worktree(task_id)
                 self.events.emit(
                     "task.complete",
                     task={
@@ -487,31 +488,30 @@ class WorktreeManager:
             )
             raise
 
+    def keep(self, name: str) -> str:
+        wt = self._find(name)
+        if not wt:
+            return f"Error: Unknown worktree '{name}'"
 
-def keep(self, name: str) -> str:
-    wt = self._find(name)
-    if not wt:
-        return f"Error: Unknown worktree '{name}'"
+        idx = self._load_index()
+        kept = None
+        for item in idx.get("worktrees", []):
+            if item.get("name") == name:
+                item["status"] = "kept"
+                item["kept_at"] = time.time()
+                kept = item
+        self._save_index(idx)
 
-    idx = self._load_index()
-    kept = None
-    for item in idx.get("worktrees", []):
-        if item.get("name") == name:
-            item["status"] = "kept"
-            item["kept_at"] = time.time()
-            kept = item
-    self._save_index(idx)
-
-    self.events.emit(
-        "worktree.keep",
-        task={"id": wt["task_id"]} if wt["task_id"] is not None else {},
-        worktree={"name": name, "path": wt.get("path", ""), "status": "kept"},
-    )
-    return (
-        json.dumps(kept, indent=2, ensure_ascii=False)
-        if kept
-        else "Error: Unknown worktree '{name}'"
-    )
+        self.events.emit(
+            "worktree.keep",
+            task={"id": wt["task_id"]} if wt["task_id"] is not None else {},
+            worktree={"name": name, "path": wt.get("path", ""), "status": "kept"},
+        )
+        return (
+            json.dumps(kept, indent=2, ensure_ascii=False)
+            if kept
+            else "Error: Unknown worktree '{name}'"
+        )
 
 
 WORKTREES = WorktreeManager(REPO_ROOT, TASKS, EVENTS)
